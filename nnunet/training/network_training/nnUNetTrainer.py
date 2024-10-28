@@ -14,6 +14,7 @@
 
 
 import shutil
+import time
 import traceback
 from collections import OrderedDict
 from multiprocessing import Pool
@@ -486,7 +487,7 @@ class nnUNetTrainer(NetworkTrainer):
                                                          use_sliding_window: bool = True, step_size: float = 0.5,
                                                          use_gaussian: bool = True, pad_border_mode: str = 'constant',
                                                          pad_kwargs: dict = None, all_in_gpu: bool = False,
-                                                         verbose: bool = True, mixed_precision: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+                                                         verbose: bool = True, mixed_precision: bool = True) :
         """
         :param data:
         :param do_mirroring:
@@ -500,6 +501,7 @@ class nnUNetTrainer(NetworkTrainer):
         :param verbose:
         :return:
         """
+        tic = time.time()
         if pad_border_mode == 'constant' and pad_kwargs is None:
             pad_kwargs = {'constant_values': 0}
 
@@ -522,6 +524,7 @@ class nnUNetTrainer(NetworkTrainer):
                                       pad_kwargs=pad_kwargs, all_in_gpu=all_in_gpu, verbose=verbose,
                                       mixed_precision=mixed_precision)
         self.network.train(current_mode)
+        # print(f"[INFO] predict_preprocessed_data_return_seg_and_softmax took {time.time() - tic}")
         return ret
 
     def validate(self, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,

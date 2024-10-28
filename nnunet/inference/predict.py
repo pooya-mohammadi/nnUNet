@@ -505,22 +505,29 @@ def predict_cases_fastest(model, list_of_lists, output_filenames, folds, num_thr
 
         # preallocate the output arrays
         # same dtype as the return value in predict_preprocessed_data_return_seg_and_softmax (saves time)
-        all_softmax_outputs = np.zeros((len(params), trainer.num_classes, *d.shape[1:]), dtype=np.float16)
+        all_softmax_outputs = [] # np.zeros((len(params), trainer.num_classes, *d.shape[1:]), dtype=np.float16)
         all_seg_outputs = np.zeros((len(params), *d.shape[1:]), dtype=int)
         print("predicting", output_filename)
-
+        prediction = None
         for i, p in enumerate(params):
             trainer.load_checkpoint_ram(p, False)
-            res = trainer.predict_preprocessed_data_return_seg_and_softmax(d, do_mirroring=do_tta,
+            res = trainer.predict_preprocessed_data_return_seg_and_softmax(deepcopy(d), do_mirroring=do_tta,
                                                                            mirror_axes=trainer.data_aug_params['mirror_axes'],
                                                                            use_sliding_window=True,
                                                                            step_size=step_size, use_gaussian=True,
                                                                            all_in_gpu=all_in_gpu,
                                                                            mixed_precision=mixed_precision)
             if len(params) > 1:
+                if prediction is None:
+                    prediction = res.to("cpu")
+                else:
+                    prediction += res.to("cpu")
                 # otherwise we dont need this and we can save ourselves the time it takes to copy that
-                all_softmax_outputs[i] = res[1]
-            all_seg_outputs[i] = res[0]
+                # all_softmax_outputs[i] = res[1]
+                # all_softmax_outputs.append(res[1])
+            # all_seg_outputs[i] = res[0]
+        if len(params) > 1:
+            prediction /= len(params)
 
         if hasattr(trainer, 'regions_class_order'):
             region_class_order = trainer.regions_class_order
@@ -529,13 +536,13 @@ def predict_cases_fastest(model, list_of_lists, output_filenames, folds, num_thr
         assert region_class_order is None, "predict_cases_fastest can only work with regular softmax predictions " \
                                            "and is therefore unable to handle trainer classes with region_class_order"
 
-        print("aggregating predictions")
-        if len(params) > 1:
-            softmax_mean = np.mean(all_softmax_outputs, 0)
-            seg = softmax_mean.argmax(0)
-        else:
-            seg = all_seg_outputs[0]
-
+        # print("aggregating predictions")
+        # if len(params) > 1:
+        #     # softmax_mean = np.mean(all_softmax_outputs, 0)
+        #     seg = prediction.argmax(0)
+        # else:
+        #     seg = all_seg_outputs[0]
+        seg = prediction.argmax(0).numpy()
         print("applying transpose_backward")
         transpose_forward = trainer.plans.get('transpose_forward')
         if transpose_forward is not None:

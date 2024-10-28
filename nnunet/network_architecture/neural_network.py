@@ -11,8 +11,10 @@
 #    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
+import time
+from functools import lru_cache
 
-
+from tqdm import tqdm
 import numpy as np
 from batchgenerators.augmentations.utils import pad_nd_image
 from nnunet.utilities.random_stuff import no_op
@@ -23,6 +25,71 @@ from scipy.ndimage.filters import gaussian_filter
 from typing import Union, Tuple, List
 
 from torch.cuda.amp import autocast
+
+
+@lru_cache(maxsize=2)
+def compute_gaussian(tile_size: Union[Tuple[int, ...], List[int]], sigma_scale: float = 1. / 8,
+                     value_scaling_factor: float = 1, dtype=torch.float16, device=torch.device('cuda', 0)) \
+        -> torch.Tensor:
+    tmp = np.zeros(tile_size)
+    center_coords = [i // 2 for i in tile_size]
+    sigmas = [i * sigma_scale for i in tile_size]
+    tmp[tuple(center_coords)] = 1
+    gaussian_importance_map = gaussian_filter(tmp, sigmas, 0, mode='constant', cval=0)
+
+    gaussian_importance_map = torch.from_numpy(gaussian_importance_map)
+
+    gaussian_importance_map /= (torch.max(gaussian_importance_map) / value_scaling_factor)
+    gaussian_importance_map = gaussian_importance_map.to(device=device, dtype=dtype)
+    # gaussian_importance_map cannot be 0, otherwise we may end up with nans!
+    mask = gaussian_importance_map == 0
+    gaussian_importance_map[mask] = torch.min(gaussian_importance_map[~mask])
+    return gaussian_importance_map
+
+
+def compute_steps_for_sliding_window(image_size: Tuple[int, ...], tile_size: Tuple[int, ...], tile_step_size: float) -> \
+        List[List[int]]:
+    assert [i >= j for i, j in zip(image_size, tile_size)], "image size must be as large or larger than patch_size"
+    assert 0 < tile_step_size <= 1, 'step_size must be larger than 0 and smaller or equal to 1'
+
+    # our step width is patch_size*step_size at most, but can be narrower. For example if we have image size of
+    # 110, patch size of 64 and step_size of 0.5, then we want to make 3 steps starting at coordinate 0, 23, 46
+    target_step_sizes_in_voxels = [i * tile_step_size for i in tile_size]
+
+    num_steps = [int(np.ceil((i - k) / j)) + 1 for i, j, k in zip(image_size, target_step_sizes_in_voxels, tile_size)]
+
+    steps = []
+    for dim in range(len(tile_size)):
+        # the highest step value for this dimension is
+        max_step_value = image_size[dim] - tile_size[dim]
+        if num_steps[dim] > 1:
+            actual_step_size = max_step_value / (num_steps[dim] - 1)
+        else:
+            actual_step_size = 99999999999  # does not matter because there is only one step at 0
+
+        steps_here = [int(np.round(actual_step_size * i)) for i in range(num_steps[dim])]
+
+        steps.append(steps_here)
+
+    return steps
+
+
+class dummy_context(object):
+    def __enter__(self):
+        pass
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+
+def empty_cache(device: torch.device):
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    elif device.type == 'mps':
+        from torch import mps
+        mps.empty_cache()
+    else:
+        pass
 
 
 class NeuralNetwork(nn.Module):
@@ -72,10 +139,11 @@ class SegmentationNetwork(NeuralNetwork):
 
     def predict_3D(self, x: np.ndarray, do_mirroring: bool, mirror_axes: Tuple[int, ...] = (0, 1, 2),
                    use_sliding_window: bool = False,
-                   step_size: float = 0.5, patch_size: Tuple[int, ...] = None, regions_class_order: Tuple[int, ...] = None,
+                   step_size: float = 0.5, patch_size: Tuple[int, ...] = None,
+                   regions_class_order: Tuple[int, ...] = None,
                    use_gaussian: bool = False, pad_border_mode: str = "constant",
                    pad_kwargs: dict = None, all_in_gpu: bool = False,
-                   verbose: bool = True, mixed_precision: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+                   verbose: bool = True, mixed_precision: bool = True):
         """
         Use this function to predict a 3D image. It does not matter whether the network is a 2D or 3D U-Net, it will
         detect that automatically and run the appropriate code.
@@ -142,20 +210,24 @@ class SegmentationNetwork(NeuralNetwork):
             with torch.no_grad():
                 if self.conv_op == nn.Conv3d:
                     if use_sliding_window:
-                        res = self._internal_predict_3D_3Dconv_tiled(x, step_size, do_mirroring, mirror_axes, patch_size,
+                        res = self._internal_predict_3D_3Dconv_tiled(x, step_size, do_mirroring, mirror_axes,
+                                                                     patch_size,
                                                                      regions_class_order, use_gaussian, pad_border_mode,
                                                                      pad_kwargs=pad_kwargs, all_in_gpu=all_in_gpu,
                                                                      verbose=verbose)
                     else:
-                        res = self._internal_predict_3D_3Dconv(x, patch_size, do_mirroring, mirror_axes, regions_class_order,
+                        res = self._internal_predict_3D_3Dconv(x, patch_size, do_mirroring, mirror_axes,
+                                                               regions_class_order,
                                                                pad_border_mode, pad_kwargs=pad_kwargs, verbose=verbose)
                 elif self.conv_op == nn.Conv2d:
                     if use_sliding_window:
-                        res = self._internal_predict_3D_2Dconv_tiled(x, patch_size, do_mirroring, mirror_axes, step_size,
+                        res = self._internal_predict_3D_2Dconv_tiled(x, patch_size, do_mirroring, mirror_axes,
+                                                                     step_size,
                                                                      regions_class_order, use_gaussian, pad_border_mode,
                                                                      pad_kwargs, all_in_gpu, False)
                     else:
-                        res = self._internal_predict_3D_2Dconv(x, patch_size, do_mirroring, mirror_axes, regions_class_order,
+                        res = self._internal_predict_3D_2Dconv(x, patch_size, do_mirroring, mirror_axes,
+                                                               regions_class_order,
                                                                pad_border_mode, pad_kwargs, all_in_gpu, False)
                 else:
                     raise RuntimeError("Invalid conv op, cannot determine what dimensionality (2d/3d) the network is")
@@ -231,11 +303,13 @@ class SegmentationNetwork(NeuralNetwork):
             with torch.no_grad():
                 if self.conv_op == nn.Conv2d:
                     if use_sliding_window:
-                        res = self._internal_predict_2D_2Dconv_tiled(x, step_size, do_mirroring, mirror_axes, patch_size,
+                        res = self._internal_predict_2D_2Dconv_tiled(x, step_size, do_mirroring, mirror_axes,
+                                                                     patch_size,
                                                                      regions_class_order, use_gaussian, pad_border_mode,
                                                                      pad_kwargs, all_in_gpu, verbose)
                     else:
-                        res = self._internal_predict_2D_2Dconv(x, patch_size, do_mirroring, mirror_axes, regions_class_order,
+                        res = self._internal_predict_2D_2Dconv(x, patch_size, do_mirroring, mirror_axes,
+                                                               regions_class_order,
                                                                pad_border_mode, pad_kwargs, verbose)
                 else:
                     raise RuntimeError("Invalid conv op, cannot determine what dimensionality (2d/3d) the network is")
@@ -259,7 +333,8 @@ class SegmentationNetwork(NeuralNetwork):
         return gaussian_importance_map
 
     @staticmethod
-    def _compute_steps_for_sliding_window(patch_size: Tuple[int, ...], image_size: Tuple[int, ...], step_size: float) -> List[List[int]]:
+    def _compute_steps_for_sliding_window(patch_size: Tuple[int, ...], image_size: Tuple[int, ...], step_size: float) -> \
+            List[List[int]]:
         assert [i >= j for i, j in zip(image_size, patch_size)], "image size must be as large or larger than patch_size"
         assert 0 < step_size <= 1, 'step_size must be larger than 0 and smaller or equal to 1'
 
@@ -267,7 +342,8 @@ class SegmentationNetwork(NeuralNetwork):
         # 110, patch size of 64 and step_size of 0.5, then we want to make 3 steps starting at coordinate 0, 23, 46
         target_step_sizes_in_voxels = [i * step_size for i in patch_size]
 
-        num_steps = [int(np.ceil((i - k) / j)) + 1 for i, j, k in zip(image_size, target_step_sizes_in_voxels, patch_size)]
+        num_steps = [int(np.ceil((i - k) / j)) + 1 for i, j, k in
+                     zip(image_size, target_step_sizes_in_voxels, patch_size)]
 
         steps = []
         for dim in range(len(patch_size)):
@@ -284,10 +360,153 @@ class SegmentationNetwork(NeuralNetwork):
 
         return steps
 
+    def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...], patch_size, tile_step_size, verbose):
+        slicers = []
+        if len(patch_size) < len(image_size):
+            assert len(patch_size) == len(
+                image_size) - 1, 'if tile_size has less entries than image_size, ' \
+                                 'len(tile_size) ' \
+                                 'must be one shorter than len(image_size) ' \
+                                 '(only dimension ' \
+                                 'discrepancy of 1 allowed).'
+            steps = compute_steps_for_sliding_window(image_size[1:], patch_size,
+                                                     tile_step_size)
+            if verbose: print(f'n_steps {image_size[0] * len(steps[0]) * len(steps[1])}, image size is'
+                              f' {image_size}, tile_size {patch_size}, '
+                              f'tile_step_size {tile_step_size}\nsteps:\n{steps}')
+            for d in range(image_size[0]):
+                for sx in steps[0]:
+                    for sy in steps[1]:
+                        slicers.append(
+                            tuple([slice(None), d, *[slice(si, si + ti) for si, ti in
+                                                     zip((sx, sy), patch_size)]]))
+        else:
+            steps = compute_steps_for_sliding_window(image_size, patch_size,
+                                                     tile_step_size)
+            if verbose: print(
+                f'n_steps {np.prod([len(i) for i in steps])}, image size is {image_size}, tile_size {patch_size}, '
+                f'tile_step_size {tile_step_size}\nsteps:\n{steps}')
+            for sx in steps[0]:
+                for sy in steps[1]:
+                    for sz in steps[2]:
+                        slicers.append(
+                            tuple([slice(None), *[slice(si, si + ti) for si, ti in
+                                                  zip((sx, sy, sz), patch_size)]]))
+        return slicers
+
+    def _internal_predict_sliding_window_return_logits(self,
+                                                       data: torch.Tensor,
+                                                       slicers,
+                                                       do_on_device: bool = True,
+                                                       ):
+        predicted_logits = n_predictions = prediction = gaussian = workon = None
+        results_device = self.device if do_on_device else torch.device('cpu')
+
+        try:
+            empty_cache(self.device)
+
+            # move data to device
+            if self.verbose:
+                print(f'move image to device {results_device}')
+            data = data.to(results_device)
+
+            # preallocate arrays
+            if self.verbose:
+                print(f'preallocating results arrays on device {results_device}')
+            predicted_logits = torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]),
+                                           dtype=torch.half,
+                                           device=results_device)
+            n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
+
+            if self.use_gaussian:
+                gaussian = compute_gaussian(tuple(self.configuration_manager.patch_size), sigma_scale=1. / 8,
+                                            value_scaling_factor=10,
+                                            device=results_device)
+            else:
+                gaussian = 1
+
+            if not self.allow_tqdm and self.verbose:
+                print(f'running prediction: {len(slicers)} steps')
+            for sl in tqdm(slicers, disable=not self.allow_tqdm):
+                tic = time.time()
+                workon = data[sl][None]
+                workon = workon.to(self.device)
+
+                prediction = self._internal_maybe_mirror_and_predict(workon)[0].to(results_device)
+
+                if self.use_gaussian:
+                    prediction *= gaussian
+                predicted_logits[sl] += prediction
+                n_predictions[sl[1:]] += gaussian
+                print(f"[INFO] tile took: {time.time() - tic}")
+
+            predicted_logits /= n_predictions
+            # check for infs
+            if torch.any(torch.isinf(predicted_logits)):
+                raise RuntimeError('Encountered inf in predicted array. Aborting... If this problem persists, '
+                                   'reduce value_scaling_factor in compute_gaussian or increase the dtype of '
+                                   'predicted_logits to fp32')
+        except Exception as e:
+            del predicted_logits, n_predictions, prediction, gaussian, workon
+            empty_cache(self.device)
+            empty_cache(results_device)
+            raise e
+        return predicted_logits
+
+    def predict_sliding_window_return_logits(self, input_image: torch.Tensor, patch_size, perform_everything_on_device,
+                                             device) \
+            -> Union[np.ndarray, torch.Tensor]:
+        with torch.no_grad():
+            assert isinstance(input_image, torch.Tensor)
+            network = self.to(self.device)
+            network.eval()
+
+            empty_cache(self.device)
+
+            # Autocast can be annoying
+            # If the device_type is 'cpu' then it's slow as heck on some CPUs (no auto bfloat16 support detection)
+            # and needs to be disabled.
+            # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False
+            # is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
+            # So autocast will only be active if we have a cuda device.
+            with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+                assert input_image.ndim == 4, 'input_image must be a 4D np.ndarray or torch.Tensor (c, x, y, z)'
+
+                if self.verbose:
+                    print(f'Input shape: {input_image.shape}')
+                    print("step_size:", self.tile_step_size)
+                    print("mirror_axes:", self.allowed_mirroring_axes if self.use_mirroring else None)
+
+                # if input_image is smaller than tile_size we need to pad it to tile_size.
+                data, slicer_revert_padding = pad_nd_image(input_image, patch_size,
+                                                           'constant', {'value': 0}, True,
+                                                           None)
+
+                slicers = self._internal_get_sliding_window_slicers(data.shape[1:])
+
+                if perform_everything_on_device and self.device != 'cpu':
+                    # we need to try except here because we can run OOM in which case we need to fall back to CPU as a results device
+                    try:
+                        predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
+                                                                                               perform_everything_on_device)
+                    except RuntimeError:
+                        print(
+                            'Prediction on device was unsuccessful, probably due to a lack of memory. Moving results arrays to CPU')
+                        empty_cache(device)
+                        predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers, False)
+                else:
+                    predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
+                                                                                           perform_everything_on_device)
+
+                empty_cache(device)
+                # revert padding
+                predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
+        return predicted_logits
+
     def _internal_predict_3D_3Dconv_tiled(self, x: np.ndarray, step_size: float, do_mirroring: bool, mirror_axes: tuple,
                                           patch_size: tuple, regions_class_order: tuple, use_gaussian: bool,
                                           pad_border_mode: str, pad_kwargs: dict, all_in_gpu: bool,
-                                          verbose: bool) -> Tuple[np.ndarray, np.ndarray]:
+                                          verbose: bool):
         # better safe than sorry
         assert len(x.shape) == 4, "x must be (c, x, y, z)"
 
@@ -319,38 +538,45 @@ class SegmentationNetwork(NeuralNetwork):
                 if verbose: print('computing Gaussian')
                 gaussian_importance_map = self._get_gaussian(patch_size, sigma_scale=1. / 8)
 
-                self._gaussian_3d = gaussian_importance_map
+                self._gaussian_3d = torch.tensor(gaussian_importance_map, device=self.get_device(), dtype=torch.half)
                 self._patch_size_for_gaussian_3d = patch_size
                 if verbose: print("done")
             else:
                 if verbose: print("using precomputed Gaussian")
                 gaussian_importance_map = self._gaussian_3d
+            if isinstance(gaussian_importance_map, np.ndarray):
+                gaussian_importance_map = torch.from_numpy(gaussian_importance_map)
 
-            gaussian_importance_map = torch.from_numpy(gaussian_importance_map)
-
-            #predict on cpu if cuda not available
+            # predict on cpu if cuda not available
             if torch.cuda.is_available():
                 gaussian_importance_map = gaussian_importance_map.cuda(self.get_device(), non_blocking=True)
 
         else:
             gaussian_importance_map = None
 
+        if use_gaussian:
+            gaussian = compute_gaussian(tuple(patch_size), sigma_scale=1. / 8,
+                                        value_scaling_factor=10,
+                                        device=torch.device(self.get_device()))
+        else:
+            gaussian = 1
+
         if all_in_gpu:
             # If we run the inference in GPU only (meaning all tensors are allocated on the GPU, this reduces
             # CPU-GPU communication but required more GPU memory) we need to preallocate a few things on GPU
 
-            if use_gaussian and num_tiles > 1:
-                # half precision for the outputs should be good enough. If the outputs here are half, the
-                # gaussian_importance_map should be as well
-                gaussian_importance_map = gaussian_importance_map.half()
-
-                # make sure we did not round anything to 0
-                gaussian_importance_map[gaussian_importance_map == 0] = gaussian_importance_map[
-                    gaussian_importance_map != 0].min()
-
-                add_for_nb_of_preds = gaussian_importance_map
-            else:
-                add_for_nb_of_preds = torch.ones(patch_size, device=self.get_device())
+            # if use_gaussian and num_tiles > 1:
+            #     # half precision for the outputs should be good enough. If the outputs here are half, the
+            #     # gaussian_importance_map should be as well
+            #     gaussian_importance_map = gaussian_importance_map.half()
+            #
+            #     # make sure we did not round anything to 0
+            #     gaussian_importance_map[gaussian_importance_map == 0] = gaussian_importance_map[
+            #         gaussian_importance_map != 0].min()
+            #
+            #     add_for_nb_of_preds = gaussian_importance_map
+            # else:
+            #     add_for_nb_of_preds = torch.ones(patch_size, device=self.get_device())
 
             if verbose: print("initializing result array (on GPU)")
             aggregated_results = torch.zeros([self.num_classes] + list(data.shape[1:]), dtype=torch.half,
@@ -360,72 +586,100 @@ class SegmentationNetwork(NeuralNetwork):
             data = torch.from_numpy(data).cuda(self.get_device(), non_blocking=True)
 
             if verbose: print("initializing result_numsamples (on GPU)")
-            aggregated_nb_of_predictions = torch.zeros([self.num_classes] + list(data.shape[1:]), dtype=torch.half,
-                                                       device=self.get_device())
+            n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=self.get_device())
+            # aggregated_nb_of_predictions = torch.zeros([self.num_classes] + list(data.shape[1:]), dtype=torch.half,
+            #                                            device=self.get_device())
 
         else:
-            if use_gaussian and num_tiles > 1:
-                add_for_nb_of_preds = self._gaussian_3d
-            else:
-                add_for_nb_of_preds = np.ones(patch_size, dtype=np.float32)
-            aggregated_results = np.zeros([self.num_classes] + list(data.shape[1:]), dtype=np.float32)
-            aggregated_nb_of_predictions = np.zeros([self.num_classes] + list(data.shape[1:]), dtype=np.float32)
+            # if use_gaussian and num_tiles > 1:
+            #     add_for_nb_of_preds = self._gaussian_3d
+            # else:
+            #     add_for_nb_of_preds = np.ones(patch_size, dtype=np.float32)
+            aggregated_results = torch.zeros([self.num_classes] + list(data.shape[1:]), dtype=torch.half,
+                                             device=self.get_device())
+            n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=self.get_device())
+            # aggregated_results = torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]),
+            #                                dtype=torch.half,
+            #                                device=results_device)
+            # aggregated_nb_of_predictions = np.zeros([self.num_classes] + list(data.shape[1:]), dtype=np.float32)
 
+        data, slicer_revert_padding = pad_nd_image(data, patch_size,
+                                                   'constant', {'value': 0}, True,
+                                                   None)
+        tbar = tqdm(range(np.prod([len(i) for i in steps])), desc="predicting", total=np.prod([len(i) for i in steps]))
+        slicers = []
         for x in steps[0]:
-            lb_x = x
-            ub_x = x + patch_size[0]
+            # lb_x = x
+            # ub_x = x + patch_size[0]
             for y in steps[1]:
-                lb_y = y
-                ub_y = y + patch_size[1]
+                # lb_y = y
+                # ub_y = y + patch_size[1]
                 for z in steps[2]:
-                    lb_z = z
-                    ub_z = z + patch_size[2]
+                    # tic_1 = time.time()
+                    # lb_z = z
+                    # ub_z = z + patch_size[2]
+                    slicers.append(tuple([slice(None), *[slice(si, si + ti) for si, ti in
+                                                         zip((x, y, z), patch_size)]]))
+        for sl in slicers:
+            # tic_1 = time.time()
+            predicted_patch = self._internal_maybe_mirror_and_pred_3D(
+                data[sl][None], mirror_axes, do_mirroring,
+                gaussian_importance_map)[0].to(self.get_device())
+            # if verbose: print(f"[INFO] Prediction took {time.time() - tic_1}")
 
-                    predicted_patch = self._internal_maybe_mirror_and_pred_3D(
-                        data[None, :, lb_x:ub_x, lb_y:ub_y, lb_z:ub_z], mirror_axes, do_mirroring,
-                        gaussian_importance_map)[0]
-
-                    if all_in_gpu:
-                        predicted_patch = predicted_patch.half()
-                    else:
-                        predicted_patch = predicted_patch.cpu().numpy()
-
-                    aggregated_results[:, lb_x:ub_x, lb_y:ub_y, lb_z:ub_z] += predicted_patch
-                    aggregated_nb_of_predictions[:, lb_x:ub_x, lb_y:ub_y, lb_z:ub_z] += add_for_nb_of_preds
-
-        # we reverse the padding here (remeber that we padded the input to be at least as large as the patch size
-        slicer = tuple(
-            [slice(0, aggregated_results.shape[i]) for i in
-             range(len(aggregated_results.shape) - (len(slicer) - 1))] + slicer[1:])
-        aggregated_results = aggregated_results[slicer]
-        aggregated_nb_of_predictions = aggregated_nb_of_predictions[slicer]
-
-        # computing the class_probabilities by dividing the aggregated result with result_numsamples
-        aggregated_results /= aggregated_nb_of_predictions
-        del aggregated_nb_of_predictions
-
-        if regions_class_order is None:
-            predicted_segmentation = aggregated_results.argmax(0)
-        else:
             if all_in_gpu:
-                class_probabilities_here = aggregated_results.detach().cpu().numpy()
-            else:
-                class_probabilities_here = aggregated_results
-            predicted_segmentation = np.zeros(class_probabilities_here.shape[1:], dtype=np.float32)
-            for i, c in enumerate(regions_class_order):
-                predicted_segmentation[class_probabilities_here[i] > 0.5] = c
+                predicted_patch = predicted_patch.half()
+            # else:
+            #     predicted_patch = predicted_patch.cpu().numpy()
+            if use_gaussian:
+                predicted_patch *= gaussian
 
-        if all_in_gpu:
-            if verbose: print("copying results to CPU")
+            aggregated_results[sl] += predicted_patch
+            n_predictions[sl[1:]] += gaussian
 
-            if regions_class_order is None:
-                predicted_segmentation = predicted_segmentation.detach().cpu().numpy()
+            # aggregated_results[:, lb_x:ub_x, lb_y:ub_y, lb_z:ub_z] += predicted_patch
+            # aggregated_nb_of_predictions[:, lb_x:ub_x, lb_y:ub_y, lb_z:ub_z] += add_for_nb_of_preds
+            # print(f"[INFO] Tile took: {time.time() - tic_1}")
+            tbar.update(1)
+        aggregated_results /= n_predictions
+        # empty_cache(self.get_device())
+        # revert padding
+        aggregated_results = aggregated_results[(slice(None), *slicer_revert_padding[1:])]
+        aggregated_results = aggregated_results.to("cpu")
+        # we reverse the padding here (remeber that we padded the input to be at least as large as the patch size
+        # slicer = tuple(
+        #     [slice(0, aggregated_results.shape[i]) for i in
+        #      range(len(aggregated_results.shape) - (len(slicer) - 1))] + slicer[1:])
+        # aggregated_results = aggregated_results[slicer]
+        # aggregated_nb_of_predictions = aggregated_nb_of_predictions[slicer]
+        #
+        # # computing the class_probabilities by dividing the aggregated result with result_numsamples
+        # aggregated_results /= aggregated_nb_of_predictions
+        del n_predictions
+        return aggregated_results
 
-            aggregated_results = aggregated_results.detach().cpu().numpy()
-
-        if verbose: print("prediction done")
-        return predicted_segmentation, aggregated_results
-
+        # if regions_class_order is None:
+        #     predicted_segmentation = aggregated_results.argmax(0)
+        # else:
+        #     if all_in_gpu:
+        #         class_probabilities_here = aggregated_results.detach().cpu().numpy()
+        #     else:
+        #         class_probabilities_here = aggregated_results
+        #     predicted_segmentation = np.zeros(class_probabilities_here.shape[1:], dtype=np.float32)
+        #     for i, c in enumerate(regions_class_order):
+        #         predicted_segmentation[class_probabilities_here[i] > 0.5] = c
+        #
+        # if all_in_gpu:
+        #     if verbose: print("copying results to CPU")
+        #
+        #     if regions_class_order is None:
+        #         predicted_segmentation = predicted_segmentation.detach().cpu().numpy()
+        #
+        #     aggregated_results = aggregated_results.detach().cpu().numpy()
+        #
+        # if verbose: print("prediction done")
+        # return predicted_segmentation.to("cpu").numpy(), aggregated_results.to("cpu").numpy()
+    #
     def _internal_predict_2D_2Dconv(self, x: np.ndarray, min_size: Tuple[int, int], do_mirroring: bool,
                                     mirror_axes: tuple = (0, 1, 2), regions_class_order: tuple = None,
                                     pad_border_mode: str = "constant", pad_kwargs: dict = None,
@@ -508,17 +762,9 @@ class SegmentationNetwork(NeuralNetwork):
         #   we now return a cuda tensor! Not numpy array!
 
         x = maybe_to_torch(x)
-        result_torch = torch.zeros([1, self.num_classes] + list(x.shape[2:]),
-                                   dtype=torch.float)
 
         if torch.cuda.is_available():
             x = to_cuda(x, gpu_id=self.get_device())
-            result_torch = result_torch.cuda(self.get_device(), non_blocking=True)
-
-        if mult is not None:
-            mult = maybe_to_torch(mult)
-            if torch.cuda.is_available():
-                mult = to_cuda(mult, gpu_id=self.get_device())
 
         if do_mirroring:
             mirror_idx = 8
@@ -526,39 +772,52 @@ class SegmentationNetwork(NeuralNetwork):
         else:
             mirror_idx = 1
             num_results = 1
+        if mirror_idx == 1:
+            pred = self.inference_apply_nonlin(self(x))
+            return pred
+        else:
+            result_torch = torch.zeros([1, self.num_classes] + list(x.shape[2:]),
+                                       dtype=torch.float)
+            if torch.cuda.is_available():
+                result_torch = result_torch.cuda(self.get_device(), non_blocking=True)
 
-        for m in range(mirror_idx):
-            if m == 0:
-                pred = self.inference_apply_nonlin(self(x))
-                result_torch += 1 / num_results * pred
+            if mult is not None:
+                mult = maybe_to_torch(mult)
+                if torch.cuda.is_available():
+                    mult = to_cuda(mult, gpu_id=self.get_device())
 
-            if m == 1 and (2 in mirror_axes):
-                pred = self.inference_apply_nonlin(self(torch.flip(x, (4, ))))
-                result_torch += 1 / num_results * torch.flip(pred, (4,))
+            for m in range(mirror_idx):
+                if m == 0:
+                    pred = self.inference_apply_nonlin(self(x))
+                    result_torch += 1 / num_results * pred
 
-            if m == 2 and (1 in mirror_axes):
-                pred = self.inference_apply_nonlin(self(torch.flip(x, (3, ))))
-                result_torch += 1 / num_results * torch.flip(pred, (3,))
+                if m == 1 and (2 in mirror_axes):
+                    pred = self.inference_apply_nonlin(self(torch.flip(x, (4,))))
+                    result_torch += 1 / num_results * torch.flip(pred, (4,))
 
-            if m == 3 and (2 in mirror_axes) and (1 in mirror_axes):
-                pred = self.inference_apply_nonlin(self(torch.flip(x, (4, 3))))
-                result_torch += 1 / num_results * torch.flip(pred, (4, 3))
+                if m == 2 and (1 in mirror_axes):
+                    pred = self.inference_apply_nonlin(self(torch.flip(x, (3,))))
+                    result_torch += 1 / num_results * torch.flip(pred, (3,))
 
-            if m == 4 and (0 in mirror_axes):
-                pred = self.inference_apply_nonlin(self(torch.flip(x, (2, ))))
-                result_torch += 1 / num_results * torch.flip(pred, (2,))
+                if m == 3 and (2 in mirror_axes) and (1 in mirror_axes):
+                    pred = self.inference_apply_nonlin(self(torch.flip(x, (4, 3))))
+                    result_torch += 1 / num_results * torch.flip(pred, (4, 3))
 
-            if m == 5 and (0 in mirror_axes) and (2 in mirror_axes):
-                pred = self.inference_apply_nonlin(self(torch.flip(x, (4, 2))))
-                result_torch += 1 / num_results * torch.flip(pred, (4, 2))
+                if m == 4 and (0 in mirror_axes):
+                    pred = self.inference_apply_nonlin(self(torch.flip(x, (2,))))
+                    result_torch += 1 / num_results * torch.flip(pred, (2,))
 
-            if m == 6 and (0 in mirror_axes) and (1 in mirror_axes):
-                pred = self.inference_apply_nonlin(self(torch.flip(x, (3, 2))))
-                result_torch += 1 / num_results * torch.flip(pred, (3, 2))
+                if m == 5 and (0 in mirror_axes) and (2 in mirror_axes):
+                    pred = self.inference_apply_nonlin(self(torch.flip(x, (4, 2))))
+                    result_torch += 1 / num_results * torch.flip(pred, (4, 2))
 
-            if m == 7 and (0 in mirror_axes) and (1 in mirror_axes) and (2 in mirror_axes):
-                pred = self.inference_apply_nonlin(self(torch.flip(x, (4, 3, 2))))
-                result_torch += 1 / num_results * torch.flip(pred, (4, 3, 2))
+                if m == 6 and (0 in mirror_axes) and (1 in mirror_axes):
+                    pred = self.inference_apply_nonlin(self(torch.flip(x, (3, 2))))
+                    result_torch += 1 / num_results * torch.flip(pred, (3, 2))
+
+                if m == 7 and (0 in mirror_axes) and (1 in mirror_axes) and (2 in mirror_axes):
+                    pred = self.inference_apply_nonlin(self(torch.flip(x, (4, 3, 2))))
+                    result_torch += 1 / num_results * torch.flip(pred, (4, 3, 2))
 
         if mult is not None:
             result_torch[:, :] *= mult
@@ -599,12 +858,12 @@ class SegmentationNetwork(NeuralNetwork):
                 result_torch += 1 / num_results * pred
 
             if m == 1 and (1 in mirror_axes):
-                pred = self.inference_apply_nonlin(self(torch.flip(x, (3, ))))
-                result_torch += 1 / num_results * torch.flip(pred, (3, ))
+                pred = self.inference_apply_nonlin(self(torch.flip(x, (3,))))
+                result_torch += 1 / num_results * torch.flip(pred, (3,))
 
             if m == 2 and (0 in mirror_axes):
-                pred = self.inference_apply_nonlin(self(torch.flip(x, (2, ))))
-                result_torch += 1 / num_results * torch.flip(pred, (2, ))
+                pred = self.inference_apply_nonlin(self(torch.flip(x, (2,))))
+                result_torch += 1 / num_results * torch.flip(pred, (2,))
 
             if m == 3 and (0 in mirror_axes) and (1 in mirror_axes):
                 pred = self.inference_apply_nonlin(self(torch.flip(x, (3, 2))))
@@ -802,7 +1061,7 @@ class SegmentationNetwork(NeuralNetwork):
     def _internal_predict_3D_2Dconv_tiled(self, x: np.ndarray, patch_size: Tuple[int, int], do_mirroring: bool,
                                           mirror_axes: tuple = (0, 1), step_size: float = 0.5,
                                           regions_class_order: tuple = None, use_gaussian: bool = False,
-                                          pad_border_mode: str = "edge", pad_kwargs: dict =None,
+                                          pad_border_mode: str = "edge", pad_kwargs: dict = None,
                                           all_in_gpu: bool = False,
                                           verbose: bool = True) -> Tuple[np.ndarray, np.ndarray]:
         if all_in_gpu:
@@ -838,8 +1097,4 @@ if __name__ == '__main__':
     print(SegmentationNetwork._compute_steps_for_sliding_window((30, 224, 224), (30, 224, 224), 1))
     print(SegmentationNetwork._compute_steps_for_sliding_window((30, 224, 224), (30, 224, 224), 0.125))
 
-
     print(SegmentationNetwork._compute_steps_for_sliding_window((123, 54, 123), (246, 162, 369), 0.25))
-
-
-
